@@ -19,42 +19,41 @@ def parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def pick_lat_lon(event: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+def pick_lat_lon(event):
     """
-    Pick a representative (lat, lon) from the latest geometry.
-    EONET uses GeoJSON coordinates = [lon, lat]
+    Extract a representative (lat, lon) by averaging all coordinates
+    from EONET geometry objects (robust centroid-style approach).
     """
     geoms = event.get("geometry", [])
     if not geoms:
         return None, None
 
-    latest = geoms[-1]
-    g = latest.get("geometry", {})
-    gtype = g.get("type")
-    coords = g.get("coordinates")
+    lats = []
+    lons = []
 
-    if not coords:
+    def extract(coords):
+        # Base case: [lon, lat]
+        if isinstance(coords, list) and len(coords) == 2 and all(
+            isinstance(x, (int, float)) for x in coords
+        ):
+            lon, lat = coords
+            lons.append(lon)
+            lats.append(lat)
+        else:
+            for c in coords:
+                extract(c)
+
+    for g in geoms:
+        coords = g.get("coordinates")
+        if coords:
+            extract(coords)
+
+    if not lats or not lons:
         return None, None
 
-    if gtype == "Point":
-        lon, lat = coords
-        return float(lat), float(lon)
+    return sum(lats) / len(lats), sum(lons) / len(lons)
 
-    # Simple fallback for LineString / Polygon
-    try:
-        # Polygon: [ [ [lon,lat], ... ] , ... ]
-        if isinstance(coords[0], list) and isinstance(coords[0][0], list):
-            lon, lat = coords[0][0]
-            return float(lat), float(lon)
 
-        # LineString: [ [lon,lat], ... ]
-        if isinstance(coords[0], list) and len(coords[0]) == 2:
-            lon, lat = coords[0]
-            return float(lat), float(lon)
-    except Exception:
-        return None, None
-
-    return None, None
 
 
 def fetch_eonet_events(days: int = 90, limit: int = 500) -> List[Dict[str, Any]]:
