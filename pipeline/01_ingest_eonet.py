@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 import psycopg2
@@ -19,7 +19,7 @@ def parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def pick_lat_lon(event):
+def pick_lat_lon(event: Dict[str, Any]):
     """
     Extract a representative (lat, lon) by averaging all coordinates
     from EONET geometry objects (robust centroid-style approach).
@@ -28,24 +28,24 @@ def pick_lat_lon(event):
     if not geoms:
         return None, None
 
-    lats = []
-    lons = []
+    lats, lons = [], []
 
     def extract(coords):
         # Base case: [lon, lat]
-        if isinstance(coords, list) and len(coords) == 2 and all(
-            isinstance(x, (int, float)) for x in coords
-        ):
+        if isinstance(coords, list) and len(coords) == 2 and all(isinstance(x, (int, float)) for x in coords):
             lon, lat = coords
             lons.append(lon)
             lats.append(lat)
-        else:
+            return
+
+        # Recursive case: list of lists
+        if isinstance(coords, list):
             for c in coords:
                 extract(c)
 
     for g in geoms:
         coords = g.get("coordinates")
-        if coords:
+        if coords is not None:
             extract(coords)
 
     if not lats or not lons:
@@ -54,9 +54,7 @@ def pick_lat_lon(event):
     return sum(lats) / len(lats), sum(lons) / len(lons)
 
 
-
-
-def fetch_eonet_events(days: int = 90, limit: int = 500) -> List[Dict[str, Any]]:
+def fetch_eonet_events(days: int = 365, limit: int = 2000) -> List[Dict[str, Any]]:
     params = {"days": days, "limit": limit, "status": "all"}
     r = requests.get(EONET_EVENTS_URL, params=params, timeout=30)
     r.raise_for_status()
@@ -93,8 +91,16 @@ def upsert_events(events: List[Dict[str, Any]]) -> int:
         geom_dates = [parse_iso_dt(g.get("date")) for g in geoms if g.get("date")]
         geom_dates = [d for d in geom_dates if d is not None]
 
+        # earliest geometry date is a stable "start"
         start_date = min(geom_dates) if geom_dates else None
-        end_date = max(geom_dates) if (geom_dates and status == "closed") else None
+
+        # latest geometry date is a useful "last updated on ground"
+        # (we store it in updated_at already, but keep updated_at from API too)
+        last_geom_date = max(geom_dates) if geom_dates else None
+
+        # end_date is not reliable from EONET v3 for many categories.
+        # Keep it NULL unless you later implement a confirmed close rule.
+        end_date = None
 
         updated_at = parse_iso_dt(e.get("updated")) if e.get("updated") else now
 
@@ -140,14 +146,14 @@ def upsert_events(events: List[Dict[str, Any]]) -> int:
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            execute_values(cur, sql, rows, page_size=200)
+            execute_values(cur, sql, rows, page_size=500)
 
     return len(rows)
 
 
 def main():
     print("Fetching NASA EONET events...")
-    events = fetch_eonet_events(days=90, limit=500)
+    events = fetch_eonet_events(days=365, limit=2000)
     print(f"Fetched {len(events)} events. Inserting into Postgres...")
 
     n = upsert_events(events)

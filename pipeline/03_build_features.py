@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -8,6 +8,10 @@ from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Controls
+RECENT_DAYS = int(os.getenv("RECENT_DAYS", "14"))   # focus on events started recently
+EARLY_DAYS = int(os.getenv("EARLY_DAYS", "2"))      # use first 2 days only
 
 
 def get_db_conn():
@@ -20,23 +24,21 @@ def get_db_conn():
     )
 
 
-def compute_escalates_7d(start_dt: Optional[datetime], end_dt: Optional[datetime]) -> Optional[int]:
+def compute_escalates_7d_from_start(start_dt: Optional[pd.Timestamp]) -> Optional[int]:
     """
-    Label:
-      1 if total event duration >= 7 days (closed events only)
-      0 if < 7 days (closed events only)
-      None for ongoing events (end_dt is null) in this simple v1
+    Proxy label:
+    1 if event age today >= 7 days, else 0.
     """
-    if start_dt is None:
+    if start_dt is None or pd.isna(start_dt):
         return None
-    if end_dt is None:
-        return None
-    duration_days = (end_dt.date() - start_dt.date()).days + 1
-    return 1 if duration_days >= 7 else 0
+    today = datetime.now(timezone.utc).date()
+    age_days = (today - start_dt.date()).days + 1
+    return 1 if age_days >= 7 else 0
 
 
 def main():
-    # Pull only events that have weather (so we can build features)
+    # We only need early-stage weather (first 2 days from start_date)
+    # and we only want recently started events to get some 0 labels.
     sql = """
     SELECT
       e.event_id,
@@ -44,31 +46,29 @@ def main():
       e.latitude,
       e.longitude,
       e.start_date,
-      e.end_date,
       w.date,
       w.temp_mean,
       w.precipitation,
       w.wind_max
     FROM events_raw e
     JOIN weather_daily w ON w.event_id = e.event_id
+    WHERE e.start_date IS NOT NULL
+      AND (CURRENT_DATE - e.start_date::date) <= %s
+      AND w.date <= (e.start_date::date + INTERVAL '1 day')
     ORDER BY e.event_id, w.date;
     """
 
     with get_db_conn() as conn:
-        df = pd.read_sql(sql, conn)
+        df = pd.read_sql(sql, conn, params=(RECENT_DAYS,))
 
     if df.empty:
-        print("No joined event+weather data found. Run weather enrichment first.")
+        print("No joined event+weather data found for the recent window. Run ingest + enrich first.")
         return
 
-    # Ensure types
+    # Types
     df["date"] = pd.to_datetime(df["date"]).dt.date
     df["start_date"] = pd.to_datetime(df["start_date"], utc=True, errors="coerce")
-    df["end_date"] = pd.to_datetime(df["end_date"], utc=True, errors="coerce")
 
-    today = datetime.now(timezone.utc).date()
-
-    # Per-event aggregations (use last available 7 days in weather_daily)
     features = []
     for event_id, g in df.groupby("event_id"):
         g = g.sort_values("date")
@@ -76,33 +76,30 @@ def main():
         category = g["category"].iloc[0]
         lat = float(g["latitude"].iloc[0])
         lon = float(g["longitude"].iloc[0])
-        start_dt = g["start_date"].iloc[0].to_pydatetime() if pd.notna(g["start_date"].iloc[0]) else None
-        end_dt = g["end_date"].iloc[0].to_pydatetime() if pd.notna(g["end_date"].iloc[0]) else None
+        start_ts = g["start_date"].iloc[0]
 
-        snapshot_date = max(g["date"])
-        # Duration so far (if ongoing, use snapshot_date)
-        if start_dt:
-            end_for_duration = end_dt.date() if end_dt else snapshot_date
-            duration_days = (end_for_duration - start_dt.date()).days + 1
-        else:
-            duration_days = None
+        # Snapshot is "day 2" (start_date + 1 day) but clamp to last available in the 2-day window
+        start_date = start_ts.date() if pd.notna(start_ts) else None
+        if start_date is None:
+            continue
 
-        # Rolling windows based on available weather
-        last_7 = g[g["date"] >= (snapshot_date - timedelta(days=6))]
-        last_3 = g[g["date"] >= (snapshot_date - timedelta(days=2))]
+        intended_snapshot = start_date + timedelta(days=EARLY_DAYS - 1)
+        available_snapshot = max(g["date"])
+        snapshot_date = min(intended_snapshot, available_snapshot)
 
-        precip_sum_7d = float(last_7["precipitation"].fillna(0).sum())
-        precip_sum_3d = float(last_3["precipitation"].fillna(0).sum())
+        # Early window (first 2 days)
+        early = g[g["date"] <= intended_snapshot]
 
-        wind_max_7d = float(last_7["wind_max"].max()) if not last_7["wind_max"].isna().all() else None
-        wind_max_3d = float(last_3["wind_max"].max()) if not last_3["wind_max"].isna().all() else None
+        # Early features
+        precip_sum_2d = float(early["precipitation"].fillna(0).sum())
+        wind_max_2d = float(early["wind_max"].max()) if not early["wind_max"].isna().all() else None
+        temp_mean_2d = float(early["temp_mean"].mean()) if not early["temp_mean"].isna().all() else None
+        extreme_precip_days_2d = int((early["precipitation"].fillna(0) >= 10.0).sum())
 
-        temp_anom_mean_3d = None  # we’ll add anomalies later properly
+        escalates_7d = compute_escalates_7d_from_start(start_ts)
 
-        # Simple “extreme rain day” count over 7 days (threshold v1)
-        extreme_precip_days_7d = int((last_7["precipitation"].fillna(0) >= 10.0).sum())
-
-        escalates_7d = compute_escalates_7d(start_dt, end_dt)
+        # duration_days is "age so far" at snapshot time (day 2)
+        duration_days_at_snapshot = (snapshot_date - start_date).days + 1
 
         features.append(
             {
@@ -112,21 +109,20 @@ def main():
                 "latitude": lat,
                 "longitude": lon,
                 "escalates_7d": escalates_7d,
-                "duration_days": duration_days,
-                "precip_sum_3d": precip_sum_3d,
-                "precip_sum_7d": precip_sum_7d,
-                "wind_max_3d": wind_max_3d,
-                "wind_max_7d": wind_max_7d,
-                "temp_anom_mean_3d": temp_anom_mean_3d,
-                "extreme_precip_days_7d": extreme_precip_days_7d,
-                "risk_score": None,  # model later
+                "duration_days": duration_days_at_snapshot,
+                "precip_sum_3d": precip_sum_2d,  # keep column name stable for now
+                "precip_sum_7d": precip_sum_2d,  # keep column name stable for now
+                "wind_max_3d": wind_max_2d,
+                "wind_max_7d": wind_max_2d,
+                "temp_anom_mean_3d": None,
+                "extreme_precip_days_7d": extreme_precip_days_2d,  # keep name stable
+                "risk_score": None,
             }
         )
 
     feat_df = pd.DataFrame(features)
-    print(f"Built features for {len(feat_df)} events.")
+    print(f"Built early-stage features for {len(feat_df)} events (recent_days={RECENT_DAYS}).")
 
-    # Upsert into events_features
     rows = []
     for _, r in feat_df.iterrows():
         rows.append(
@@ -176,7 +172,7 @@ def main():
 
     with get_db_conn() as conn:
         with conn.cursor() as cur:
-            execute_values(cur, upsert_sql, rows, page_size=200)
+            execute_values(cur, upsert_sql, rows, page_size=500)
 
     print("✅ Upserted into events_features.")
 
